@@ -21,6 +21,7 @@ class ProcessVideoClipper implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     private const BRAND_LOGO_PATH = 'resources/brand/framedrop_pp_v1.png';
+    private const TEXT_OVERLAY_FONT_PATH = 'resources/fonts/OpenSans-Bold.ttf';
 
     public int $timeout = 1200;
     public int $tries = 1;
@@ -37,6 +38,8 @@ class ProcessVideoClipper implements ShouldQueue
     {
         $clip = Clip::findOrFail($this->clipId);
         $outputPath = null;
+        $subtitlePath = null;
+        $thumbnailPath = null;
 
         try {
             $clip->update([
@@ -61,6 +64,17 @@ class ProcessVideoClipper implements ShouldQueue
 
             $clip->update(['progress' => 45]);
 
+            if ($clip->subtitle_enabled) {
+                Log::info('Mencoba mengunduh subtitle.', ['clip_id' => $clip->id, 'lang' => $clip->subtitle_language ?? 'id']);
+                $subtitlePath = $this->downloadSubtitles($clip);
+                if ($subtitlePath) {
+                    $clip->update(['progress' => 55]);
+                    Log::info('Subtitle berhasil diunduh.', ['path' => $subtitlePath]);
+                } else {
+                    Log::warning('Tidak menemukan subtitle otomatis untuk video ini.', ['clip_id' => $clip->id]);
+                }
+            }
+
             Storage::disk('public')->makeDirectory('clips');
 
             $outputPath = 'clips/shorts_'.$clip->id.'_'.Str::random(10).'.mp4';
@@ -68,13 +82,13 @@ class ProcessVideoClipper implements ShouldQueue
 
             $clip->update(['progress' => 65]);
 
-            Log::info('Memulai render ffmpeg tanpa menyimpan video mentah.', [
+            Log::info('Memulai render ffmpeg.', [
                 'clip_id' => $clip->id,
                 'output_path' => $outputPath,
             ]);
 
             $this->runProcess(
-                $this->buildFfmpegProcess($clip, $streamUrls, $absoluteOutputPath),
+                $this->buildFfmpegProcess($clip, $streamUrls, $absoluteOutputPath, $subtitlePath),
                 'Render ffmpeg gagal.'
             );
 
@@ -82,11 +96,20 @@ class ProcessVideoClipper implements ShouldQueue
                 throw new RuntimeException('FFmpeg selesai, tapi file hasil tidak ditemukan atau kosong.');
             }
 
+            Log::info('Membuat thumbnail otomatis.', ['clip_id' => $clip->id]);
+            $thumbnailPath = $this->generateThumbnail($clip, $absoluteOutputPath);
+            Log::info('Thumbnail berhasil dibuat.', ['path' => $thumbnailPath]);
+
+            Log::info('Membuat caption dan hashtag.', ['clip_id' => $clip->id]);
+            $generatedCaption = $this->generateCaption($clip);
+
             $clip->update([
                 'status' => Clip::STATUS_DONE,
                 'progress' => 100,
                 'output_disk' => 'public',
                 'output_path' => $outputPath,
+                'thumbnail_path' => $thumbnailPath,
+                'generated_caption' => $generatedCaption,
                 'finished_at' => now(),
             ]);
 
@@ -97,6 +120,9 @@ class ProcessVideoClipper implements ShouldQueue
         } catch (Throwable $exception) {
             if ($outputPath && Storage::disk('public')->exists($outputPath)) {
                 Storage::disk('public')->delete($outputPath);
+            }
+            if ($thumbnailPath && Storage::disk('public')->exists($thumbnailPath)) {
+                Storage::disk('public')->delete($thumbnailPath);
             }
 
             $clip->update([
@@ -112,6 +138,11 @@ class ProcessVideoClipper implements ShouldQueue
             ]);
 
             throw $exception;
+        } finally {
+            // Selalu hapus file subtitle temporer jika ada
+            if ($subtitlePath && file_exists($subtitlePath)) {
+                unlink($subtitlePath);
+            }
         }
     }
 
@@ -169,7 +200,35 @@ class ProcessVideoClipper implements ShouldQueue
         return $urls;
     }
 
-    private function buildFfmpegProcess(Clip $clip, array $streamUrls, string $absoluteOutputPath): Process
+    private function downloadSubtitles(Clip $clip): ?string
+    {
+        $tempDir = sys_get_temp_dir();
+        $lang = $clip->subtitle_language ?? 'id';
+
+        $process = new Process([
+            'yt-dlp',
+            '--write-auto-sub',
+            '--sub-lang', $lang,
+            '--sub-format', 'ass',
+            '--skip-download',
+            '--output', $tempDir.'/%(id)s.%(ext)s',
+            $clip->youtube_url,
+        ]);
+
+        $output = $this->runProcess($process, 'Gagal mengunduh subtitle.');
+
+        // Cari path file subtitle dari output yt-dlp
+        if (preg_match('/\[info\] Writing video subtitles to: (.*)/', $output, $matches)) {
+            $subtitlePath = trim($matches[1]);
+            if (file_exists($subtitlePath)) {
+                return $subtitlePath;
+            }
+        }
+
+        return null;
+    }
+
+    private function buildFfmpegProcess(Clip $clip, array $streamUrls, string $absoluteOutputPath, ?string $subtitlePath): Process
     {
         $arguments = ['ffmpeg', '-hide_banner', '-y'];
         $arguments = $this->appendInput($arguments, $streamUrls[0], $clip->start_time);
@@ -204,7 +263,7 @@ class ProcessVideoClipper implements ShouldQueue
             '-t',
             (string) $clip->duration,
             '-filter_complex',
-            $this->filterComplex($clip, $logoInputIndex),
+            $this->filterComplex($clip, $logoInputIndex, $subtitlePath),
             '-map',
             '[vout]',
             '-map',
@@ -257,13 +316,25 @@ class ProcessVideoClipper implements ShouldQueue
         ]);
     }
 
-    private function filterComplex(Clip $clip, ?int $logoInputIndex): string
+    private function filterComplex(Clip $clip, ?int $logoInputIndex, ?string $subtitlePath): string
     {
         $parts = [
             '[0:v:0]'.$this->baseVideoFilter($clip).'[v0]',
         ];
         $current = 'v0';
         $step = 1;
+
+        if ($clip->hook_text_enabled && ! empty($clip->hook_text_content)) {
+            $parts[] = '['.$current.']'.$this->hookTextFilter($clip).'[v'.$step.']';
+            $current = 'v'.$step;
+            $step++;
+        }
+
+        if ($subtitlePath) {
+            $parts[] = '['.$current.']'.$this->subtitleFilter($subtitlePath).'[v'.$step.']';
+            $current = 'v'.$step;
+            $step++;
+        }
 
         if ($logoInputIndex !== null && $clip->watermark_enabled) {
             $parts[] = '['.$logoInputIndex.':v:0]'
@@ -291,6 +362,48 @@ class ProcessVideoClipper implements ShouldQueue
         $parts[] = '['.$current.']format=yuv420p[vout]';
 
         return implode(';', $parts);
+    }
+
+    private function hookTextFilter(Clip $clip): string
+    {
+        $fontPath = $this->getEscapedFontPath();
+        $text = addcslashes($clip->hook_text_content, "':");
+        $fontSize = 64; // Font lebih besar untuk hook
+        $fontColor = 'white';
+
+        // Tampilkan selama 2 detik pertama, di tengah atas.
+        return "drawtext=fontfile='{$fontPath}':text='{$text}':fontcolor={$fontColor}:fontsize={$fontSize}:x=(w-text_w)/2:y=h*0.25:box=1:boxcolor=black@0.5:boxborderw=15:enable='between(t,0,2)'";
+    }
+
+    private function subtitleFilter(string $subtitlePath): string
+    {
+        // FFmpeg di Windows memerlukan path escaping yang sangat spesifik untuk filter subtitle.
+        $escapedPath = str_replace('\\', '/', $subtitlePath);
+        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+            $escapedPath = str_replace(':', '\\:', $escapedPath);
+        }
+
+        // Style: Bold, Putih dengan outline/shadow hitam, di tengah bawah (posisi aman).
+        $style = "FontName=Open Sans,FontSize=42,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=350";
+
+        return "subtitles='{$escapedPath}':force_style='{$style}'";
+    }
+
+    private function getEscapedFontPath(): string
+    {
+        $fontPath = base_path(self::TEXT_OVERLAY_FONT_PATH);
+        if (! file_exists($fontPath)) {
+            // Pastikan Anda menaruh file font .ttf di resources/fonts/
+            throw new RuntimeException('Font file belum tersedia di '.self::TEXT_OVERLAY_FONT_PATH.'.');
+        }
+
+        $escapedFontPath = str_replace('\\', '/', $fontPath);
+        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+            // Escaping khusus untuk Windows
+            $escapedFontPath = '///'.str_replace(':', '\:', $escapedFontPath);
+        }
+
+        return $escapedFontPath;
     }
 
     private function baseVideoFilter(Clip $clip): string
@@ -325,9 +438,9 @@ class ProcessVideoClipper implements ShouldQueue
     {
         return match ($position) {
             'top-left' => '36:36',
-            'bottom-left' => '36:H-h-220',
-            'bottom-right' => 'W-w-36:H-h-220',
-            default => 'W-w-36:36',
+            'bottom-left' => '36:H-h-340',
+            'bottom-right' => 'W-w-36:H-h-340',
+            default => 'W-w-36:36', // top-right
         };
     }
 
@@ -358,5 +471,53 @@ class ProcessVideoClipper implements ShouldQueue
         }
 
         return $process->getOutput();
+    }
+
+    private function generateThumbnail(Clip $clip, string $videoPath): string
+    {
+        Storage::disk('public')->makeDirectory('thumbnails');
+        $thumbnailPath = 'thumbnails/thumb_'.$clip->id.'_'.Str::random(10).'.jpg';
+        $absoluteThumbnailPath = Storage::disk('public')->path($thumbnailPath);
+
+        $seekTime = max(0, ($clip->duration / 2) - 1); // Ambil frame dari tengah video
+        $fontPath = $this->getEscapedFontPath();
+        $title = addcslashes($clip->displayTitle(25), "':"); // Judul singkat untuk thumbnail
+
+        $process = new Process([
+            'ffmpeg',
+            '-ss', (string) $seekTime,
+            '-i', $videoPath,
+            '-vf', "drawtext=fontfile='{$fontPath}':text='{$title}':fontcolor=white:fontsize=80:x=(w-text_w)/2:y=h*0.75:box=1:boxcolor=black@0.6:boxborderw=20",
+            '-vframes', '1',
+            '-q:v', '2', // Kualitas JPEG tinggi
+            $absoluteThumbnailPath,
+        ]);
+
+        $this->runProcess($process, 'Gagal membuat thumbnail.');
+
+        return $thumbnailPath;
+    }
+
+    private function generateCaption(Clip $clip): string
+    {
+        $title = $clip->displayTitle(80);
+        $hashtags = [
+            '#'.Str::slug($clip->user->name ?? 'autoclip'),
+            '#fyp',
+            '#gamingclips',
+            '#clip',
+        ];
+
+        // Logika sederhana untuk ekstrak nama game dari judul
+        if (preg_match('/(?:playing|main|game)\s+([a-zA-Z0-9\s]+)/i', $clip->source_title ?? '', $matches)) {
+            $game = trim($matches[1]);
+            if (strlen($game) > 3) {
+                $hashtags[] = '#'.Str::slug($game);
+            }
+        }
+
+        $cta = "\n\n".'Dibuat dengan AutoClip Pro ✨';
+
+        return $title."\n\n".implode(' ', array_slice($hashtags, 0, 5)).$cta;
     }
 }
