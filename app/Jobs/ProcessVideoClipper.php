@@ -125,16 +125,10 @@ class ProcessVideoClipper implements ShouldQueue
                 Storage::disk('public')->delete($thumbnailPath);
             }
 
-            $clip->update([
-                'status' => Clip::STATUS_FAILED,
-                'progress' => min($clip->progress, 95),
-                'error_message' => Str::limit($exception->getMessage(), 5000),
-                'finished_at' => now(),
-            ]);
-
             Log::error('Clip gagal diproses.', [
                 'clip_id' => $clip->id,
-                'error' => $exception->getMessage(),
+                // Log the full exception for better debugging
+                'error' => (string) $exception,
             ]);
 
             throw $exception;
@@ -148,6 +142,7 @@ class ProcessVideoClipper implements ShouldQueue
 
     public function failed(Throwable $exception): void
     {
+        // This method is called by Laravel when the job fails permanently.
         Clip::whereKey($this->clipId)->update([
             'status' => Clip::STATUS_FAILED,
             'error_message' => Str::limit($exception->getMessage(), 5000),
@@ -346,6 +341,12 @@ class ProcessVideoClipper implements ShouldQueue
             $step++;
         }
 
+        if ($clip->outro_text_enabled && ! empty($clip->outro_text_content)) {
+            $parts[] = '['.$current.']'.$this->outroTextFilter($clip).'[v'.$step.']';
+            $current = 'v'.$step;
+            $step++;
+        }
+
         if ($logoInputIndex !== null && $clip->signature_enabled) {
             $signatureStart = number_format(max(0, $clip->duration - 3.2), 2, '.', '');
             $signatureFadeOut = number_format(max(0, $clip->duration - 0.45), 2, '.', '');
@@ -373,6 +374,23 @@ class ProcessVideoClipper implements ShouldQueue
 
         // Tampilkan selama 2 detik pertama, di tengah atas.
         return "drawtext=fontfile='{$fontPath}':text='{$text}':fontcolor={$fontColor}:fontsize={$fontSize}:x=(w-text_w)/2:y=h*0.25:box=1:boxcolor=black@0.5:boxborderw=15:enable='between(t,0,2)'";
+    }
+
+    private function outroTextFilter(Clip $clip): string
+    {
+        $fontPath = $this->getEscapedFontPath();
+        $text = addcslashes($clip->outro_text_content ?? '', "':");
+        $fontSize = 56;
+        $fontColor = 'white';
+        $duration = 3;
+        $startTime = max(0, $clip->duration - $duration);
+
+        // Jika signature (logo outro) juga aktif, letakkan teks di atas tengah agar tidak tumpang tindih.
+        // Jika tidak, letakkan di tengah layar.
+        $yPos = ($clip->signature_enabled) ? 'h*0.35' : '(h-text_h)/2';
+
+        // Tampilkan selama 3 detik terakhir.
+        return "drawtext=fontfile='{$fontPath}':text='{$text}':fontcolor={$fontColor}:fontsize={$fontSize}:x=(w-text_w)/2:y={$yPos}:box=1:boxcolor=black@0.5:boxborderw=15:enable='gte(t,{$startTime})'";
     }
 
     private function subtitleFilter(string $subtitlePath): string
