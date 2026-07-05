@@ -212,7 +212,16 @@ class ProcessVideoClipper implements ShouldQueue
             $clip->youtube_url,
         ]);
 
-        $output = $this->runProcess($process, 'Gagal mengunduh subtitle.');
+        try {
+            $output = $this->runProcess($process, 'Gagal mengunduh subtitle.');
+        } catch (RuntimeException $e) {
+            Log::warning('Gagal mengunduh subtitle, proses akan dilanjutkan tanpa subtitle.', [
+                'clip_id' => $clip->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
 
         // Cari path file subtitle dari output yt-dlp
         if (preg_match('/\[info\] Writing video subtitles to: (.*)/', $output, $matches)) {
