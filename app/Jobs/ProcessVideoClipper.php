@@ -23,7 +23,7 @@ class ProcessVideoClipper implements ShouldQueue
     private const BRAND_LOGO_PATH = 'resources/brand/framedrop_pp_v1.png';
     private const TEXT_OVERLAY_FONT_PATH = 'resources/fonts/OpenSans-Bold.ttf';
 
-    public int $timeout = 1200;
+    public int $timeout = 3600;
     public int $tries = 1;
     public bool $failOnTimeout = true;
 
@@ -64,7 +64,9 @@ class ProcessVideoClipper implements ShouldQueue
 
             $clip->update(['progress' => 45]);
 
-            if ($clip->subtitle_enabled) {
+            // Paksa nyala karena field subtitle_enabled tidak ada di database,
+            // dan ini wajib untuk lolos rules campaign.
+            if (true) {
                 Log::info('Mencoba mengunduh subtitle.', ['clip_id' => $clip->id, 'lang' => $clip->subtitle_language ?? 'id']);
                 $subtitlePath = $this->downloadSubtitles($clip);
                 if ($subtitlePath) {
@@ -203,7 +205,7 @@ class ProcessVideoClipper implements ShouldQueue
         $process = new Process([
             'yt-dlp',
             '--write-auto-sub',
-            '--sub-lang', $lang,
+            '--sub-lang', $lang.',en,en-US',
             '--sub-format', 'ass',
             '--skip-download',
             '--output', $tempDir.'/%(id)s.%(ext)s',
@@ -216,6 +218,21 @@ class ProcessVideoClipper implements ShouldQueue
         if (preg_match('/\[info\] Writing video subtitles to: (.*)/', $output, $matches)) {
             $subtitlePath = trim($matches[1]);
             if (file_exists($subtitlePath)) {
+                $assPath = $tempDir.'/'.$clip->id.'_sub_'.Str::random(5).'.ass';
+                $offsetProcess = new Process([
+                    'ffmpeg', '-y',
+                    '-ss', (string) $clip->start_time,
+                    '-i', $subtitlePath,
+                    $assPath
+                ]);
+                $offsetProcess->run();
+
+                if ($offsetProcess->isSuccessful() && file_exists($assPath)) {
+                    // Hapus file VTT asli agar tidak menumpuk
+                    @unlink($subtitlePath);
+                    return $assPath;
+                }
+                
                 return $subtitlePath;
             }
         }
@@ -313,14 +330,15 @@ class ProcessVideoClipper implements ShouldQueue
 
     private function filterComplex(Clip $clip, ?int $logoInputIndex, ?string $subtitlePath): string
     {
+        $fontPath = $this->getEscapedFontPath();
         $parts = [
             '[0:v:0]'.$this->baseVideoFilter($clip).'[v0]',
         ];
         $current = 'v0';
         $step = 1;
 
-        if ($clip->hook_text_enabled && ! empty($clip->hook_text_content)) {
-            $parts[] = '['.$current.']'.$this->hookTextFilter($clip).'[v'.$step.']';
+        if ($fontPath && $clip->hook_text_enabled && ! empty($clip->hook_text_content)) {
+            $parts[] = '['.$current.']'.$this->hookTextFilter($clip, $fontPath).'[v'.$step.']';
             $current = 'v'.$step;
             $step++;
         }
@@ -333,16 +351,16 @@ class ProcessVideoClipper implements ShouldQueue
 
         if ($logoInputIndex !== null && $clip->watermark_enabled) {
             $parts[] = '['.$logoInputIndex.':v:0]'
-                ."crop=iw*0.76:ih*0.76:iw*0.12:ih*0.04,scale=190:-1,format=rgba,"
-                ."colorkey=0x0b0b0b:0.18:0.08,colorchannelmixer=aa=".$this->alpha($clip->watermark_opacity)
+                ."scale=190:-1,format=rgba,"
+                ."colorchannelmixer=aa=".$this->alpha($clip->watermark_opacity)
                 .'[wm]';
             $parts[] = '['.$current.'][wm]overlay='.$this->watermarkPosition($clip->watermark_position).':format=auto[v'.$step.']';
             $current = 'v'.$step;
             $step++;
         }
 
-        if ($clip->outro_text_enabled && ! empty($clip->outro_text_content)) {
-            $parts[] = '['.$current.']'.$this->outroTextFilter($clip).'[v'.$step.']';
+        if ($fontPath && $clip->outro_text_enabled && ! empty($clip->outro_text_content)) {
+            $parts[] = '['.$current.']'.$this->outroTextFilter($clip, $fontPath).'[v'.$step.']';
             $current = 'v'.$step;
             $step++;
         }
@@ -352,7 +370,7 @@ class ProcessVideoClipper implements ShouldQueue
             $signatureFadeOut = number_format(max(0, $clip->duration - 0.45), 2, '.', '');
 
             $parts[] = '['.$logoInputIndex.':v:0]'
-                .'scale=620:-1,format=rgba,colorkey=0x0b0b0b:0.18:0.08,colorchannelmixer=aa=0.78,'
+                .'scale=620:-1,format=rgba,colorchannelmixer=aa=0.78,'
                 .'fade=t=in:st='.$signatureStart.':d=0.35:alpha=1,'
                 .'fade=t=out:st='.$signatureFadeOut.':d=0.35:alpha=1'
                 .'[sig]';
@@ -365,10 +383,9 @@ class ProcessVideoClipper implements ShouldQueue
         return implode(';', $parts);
     }
 
-    private function hookTextFilter(Clip $clip): string
+    private function hookTextFilter(Clip $clip, string $fontPath): string
     {
-        $fontPath = $this->getEscapedFontPath();
-        $text = addcslashes($clip->hook_text_content, "':");
+        $text = addcslashes($clip->hook_text_content ?? '', "':");
         $fontSize = 64; // Font lebih besar untuk hook
         $fontColor = 'white';
 
@@ -376,9 +393,8 @@ class ProcessVideoClipper implements ShouldQueue
         return "drawtext=fontfile='{$fontPath}':text='{$text}':fontcolor={$fontColor}:fontsize={$fontSize}:x=(w-text_w)/2:y=h*0.25:box=1:boxcolor=black@0.5:boxborderw=15:enable='between(t,0,2)'";
     }
 
-    private function outroTextFilter(Clip $clip): string
+    private function outroTextFilter(Clip $clip, string $fontPath): string
     {
-        $fontPath = $this->getEscapedFontPath();
         $text = addcslashes($clip->outro_text_content ?? '', "':");
         $fontSize = 56;
         $fontColor = 'white';
@@ -407,12 +423,13 @@ class ProcessVideoClipper implements ShouldQueue
         return "subtitles='{$escapedPath}':force_style='{$style}'";
     }
 
-    private function getEscapedFontPath(): string
+    private function getEscapedFontPath(): ?string
     {
         $fontPath = base_path(self::TEXT_OVERLAY_FONT_PATH);
         if (! file_exists($fontPath)) {
-            // Pastikan Anda menaruh file font .ttf di resources/fonts/
-            throw new RuntimeException('Font file belum tersedia di '.self::TEXT_OVERLAY_FONT_PATH.'.');
+            Log::warning('Font file tidak ditemukan, fitur text overlay (hook, outro, thumbnail) akan dilewati.', ['path' => self::TEXT_OVERLAY_FONT_PATH]);
+
+            return null;
         }
 
         $escapedFontPath = str_replace('\\', '/', $fontPath);
@@ -428,14 +445,14 @@ class ProcessVideoClipper implements ShouldQueue
     {
         $filters = [
             $this->cropFilter($clip->crop_mode),
-            'scale=1080:1920:flags=lanczos',
+            'scale=1080:1920', // dihapus flags=lanczos karena terlalu berat untuk CPU
             'fps=30',
             'setsar=1',
         ];
 
         if ($clip->polish_enabled) {
             $filters[] = 'eq=contrast=1.06:saturation=1.12:brightness=0.01';
-            $filters[] = 'unsharp=5:5:0.45:3:3:0.15';
+            $filters[] = 'unsharp=3:3:0.3'; // diperingan ukurannya agar render lebih cepat
         }
 
         return implode(',', $filters);
@@ -498,18 +515,28 @@ class ProcessVideoClipper implements ShouldQueue
         $absoluteThumbnailPath = Storage::disk('public')->path($thumbnailPath);
 
         $seekTime = max(0, ($clip->duration / 2) - 1); // Ambil frame dari tengah video
-        $fontPath = $this->getEscapedFontPath();
-        $title = addcslashes($clip->displayTitle(25), "':"); // Judul singkat untuk thumbnail
 
-        $process = new Process([
+        $arguments = [
             'ffmpeg',
             '-ss', (string) $seekTime,
             '-i', $videoPath,
-            '-vf', "drawtext=fontfile='{$fontPath}':text='{$title}':fontcolor=white:fontsize=80:x=(w-text_w)/2:y=h*0.75:box=1:boxcolor=black@0.6:boxborderw=20",
+        ];
+
+        $fontPath = $this->getEscapedFontPath();
+        if ($fontPath) {
+            $title = addcslashes($clip->displayTitle(25), "':"); // Judul singkat untuk thumbnail
+            $arguments = array_merge($arguments, [
+                '-vf', "drawtext=fontfile='{$fontPath}':text='{$title}':fontcolor=white:fontsize=80:x=(w-text_w)/2:y=h*0.75:box=1:boxcolor=black@0.6:boxborderw=20",
+            ]);
+        }
+
+        $arguments = array_merge($arguments, [
             '-vframes', '1',
             '-q:v', '2', // Kualitas JPEG tinggi
             $absoluteThumbnailPath,
         ]);
+
+        $process = new Process($arguments);
 
         $this->runProcess($process, 'Gagal membuat thumbnail.');
 
