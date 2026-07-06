@@ -17,7 +17,6 @@
                 <h1 class="mt-1 text-xl font-semibold tracking-tight text-white">YouTube Short Converter</h1>
             </div>
             <div class="hidden text-right text-sm text-zinc-400 sm:block">
-                <p>Raw YouTube video tidak disimpan</p>
                 <p class="text-zinc-500">Output final tersimpan di storage publik aplikasi</p>
             </div>
         </div>
