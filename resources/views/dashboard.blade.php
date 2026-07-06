@@ -232,11 +232,11 @@
                         <article class="grid gap-4 p-5 xl:grid-cols-[180px_1fr]">
                             <div class="overflow-hidden rounded-md border border-zinc-800 bg-zinc-950">
                                 @if ($clip->isDone())
-                                    <video controls preload="metadata" class="aspect-[9/16] h-full w-full bg-black object-cover">
+                                    <video controls preload="metadata" class="aspect-9/16 h-full w-full bg-black object-cover">
                                         <source src="{{ route('clips.stream', $clip) }}" type="video/mp4">
                                     </video>
                                 @else
-                                    <div class="flex aspect-[9/16] items-center justify-center px-4 text-center text-sm text-zinc-500">
+                                    <div class="flex aspect-9/16 items-center justify-center px-4 text-center text-sm text-zinc-500">
                                         {{ ucfirst($clip->status) }}
                                     </div>
                                 @endif
