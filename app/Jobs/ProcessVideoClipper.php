@@ -146,7 +146,7 @@ class ProcessVideoClipper implements ShouldQueue
     private function fetchMetadata(string $youtubeUrl): array
     {
         $output = $this->runProcess(new Process([
-            'yt-dlp',
+            config('media-tools.yt_dlp_path', 'yt-dlp'),
             '--dump-json',
             '--no-playlist',
             '--no-warnings',
@@ -165,7 +165,7 @@ class ProcessVideoClipper implements ShouldQueue
         $endTime = $this->secondsToTimestamp($clip->start_time + $clip->duration);
 
         $process = new Process([
-            'yt-dlp',
+            config('media-tools.yt_dlp_path', 'yt-dlp'),
             '--no-playlist',
             '--no-warnings',
             '-f', $this->formatSelector($clip->quality_height),
@@ -188,7 +188,7 @@ class ProcessVideoClipper implements ShouldQueue
 
     private function buildFfmpegProcess(Clip $clip, string $inputPath, string $absoluteOutputPath): Process
     {
-        $arguments = ['ffmpeg', '-hide_banner', '-y'];
+        $arguments = [config('media-tools.ffmpeg_path', 'ffmpeg'), '-hide_banner', '-y'];
         $arguments = array_merge($arguments, ['-i', $inputPath]);
         $logoPath = base_path(self::BRAND_LOGO_PATH);
         $logoInputIndex = null;
@@ -423,7 +423,7 @@ class ProcessVideoClipper implements ShouldQueue
         $seekTime = max(0, ($clip->duration / 2) - 1); // Ambil frame dari tengah video
 
         $arguments = [
-            'ffmpeg',
+            config('media-tools.ffmpeg_path', 'ffmpeg'),
             '-ss', (string) $seekTime,
             '-i', $videoPath,
         ];
