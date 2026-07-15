@@ -38,8 +38,8 @@ class ProcessVideoClipper implements ShouldQueue
     {
         $clip = Clip::findOrFail($this->clipId);
         $outputPath = null;
-        $subtitlePath = null;
         $thumbnailPath = null;
+        $tempVideoPath = null;
 
         try {
             $clip->update([
@@ -59,38 +59,23 @@ class ProcessVideoClipper implements ShouldQueue
                 'progress' => 20,
             ]);
 
-            Log::info('Membaca direct stream URL YouTube.', ['clip_id' => $clip->id]);
-            $streamUrls = $this->resolveStreamUrls($clip);
-
-            $clip->update(['progress' => 45]);
-
-            // Paksa nyala karena field subtitle_enabled tidak ada di database,
-            // dan ini wajib untuk lolos rules campaign.
-            if (true) {
-                Log::info('Mencoba mengunduh subtitle.', ['clip_id' => $clip->id, 'lang' => $clip->subtitle_language ?? 'id']);
-                $subtitlePath = $this->downloadSubtitles($clip);
-                if ($subtitlePath) {
-                    $clip->update(['progress' => 55]);
-                    Log::info('Subtitle berhasil diunduh.', ['path' => $subtitlePath]);
-                } else {
-                    Log::warning('Tidak menemukan subtitle otomatis untuk video ini.', ['clip_id' => $clip->id]);
-                }
-            }
-
             Storage::disk('public')->makeDirectory('clips');
 
             $outputPath = 'clips/shorts_'.$clip->id.'_'.Str::random(10).'.mp4';
             $absoluteOutputPath = Storage::disk('public')->path($outputPath);
 
-            $clip->update(['progress' => 65]);
+            Log::info('Mendownload segmen video dari YouTube.', ['clip_id' => $clip->id]);
+            $tempVideoPath = $this->downloadVideoSegment($clip);
+            $clip->update(['progress' => 70]);
 
             Log::info('Memulai render ffmpeg.', [
                 'clip_id' => $clip->id,
+                'input_path' => $tempVideoPath,
                 'output_path' => $outputPath,
             ]);
 
             $this->runProcess(
-                $this->buildFfmpegProcess($clip, $streamUrls, $absoluteOutputPath, $subtitlePath),
+                $this->buildFfmpegProcess($clip, $tempVideoPath, $absoluteOutputPath),
                 'Render ffmpeg gagal.'
             );
 
@@ -135,10 +120,11 @@ class ProcessVideoClipper implements ShouldQueue
 
             throw $exception;
         } finally {
-            // Selalu hapus file subtitle temporer jika ada
-            if ($subtitlePath && file_exists($subtitlePath)) {
-                unlink($subtitlePath);
+            if ($tempVideoPath && file_exists($tempVideoPath)) {
+                unlink($tempVideoPath);
             }
+
+            throw $exception;
         }
     }
 
@@ -170,108 +156,48 @@ class ProcessVideoClipper implements ShouldQueue
         return json_decode($output, true, flags: JSON_THROW_ON_ERROR);
     }
 
-    /**
-     * @return list<string>
-     */
-    private function resolveStreamUrls(Clip $clip): array
+    private function downloadVideoSegment(Clip $clip): string
     {
-        $output = $this->runProcess(new Process([
-            'yt-dlp',
-            '--no-playlist',
-            '--no-warnings',
-            '-f',
-            $this->formatSelector($clip->quality_height),
-            '-g',
-            $clip->youtube_url,
-        ]), 'Gagal membaca direct stream URL YouTube.');
+        Storage::disk('local')->makeDirectory('temp_clips');
+        $tempPath = Storage::disk('local')->path('temp_clips/clip_'.Str::random(16));
 
-        $urls = array_values(array_filter(
-            preg_split('/\R/', trim($output)) ?: [],
-            fn (string $line): bool => str_starts_with(trim($line), 'http')
-        ));
-
-        if ($urls === []) {
-            throw new RuntimeException('yt-dlp tidak mengembalikan stream URL yang bisa dipakai.');
-        }
-
-        return $urls;
-    }
-
-    private function downloadSubtitles(Clip $clip): ?string
-    {
-        $tempDir = sys_get_temp_dir();
-        $lang = $clip->subtitle_language ?? 'id';
+        $startTime = $this->secondsToTimestamp($clip->start_time);
+        $endTime = $this->secondsToTimestamp($clip->start_time + $clip->duration);
 
         $process = new Process([
             'yt-dlp',
-            '--write-auto-sub',
-            '--sub-lang', $lang.',en,en-US',
-            '--sub-format', 'ass',
-            '--skip-download',
-            '--output', $tempDir.'/%(id)s.%(ext)s',
+            '--no-playlist',
+            '--no-warnings',
+            '-f', $this->formatSelector($clip->quality_height),
+            '--download-sections', "*{$startTime}-{$endTime}",
+            '--force-keyframes-at-cuts',
+            '-o', $tempPath,
             $clip->youtube_url,
         ]);
 
-        try {
-            $output = $this->runProcess($process, 'Gagal mengunduh subtitle.');
-        } catch (RuntimeException $e) {
-            Log::warning('Gagal mengunduh subtitle, proses akan dilanjutkan tanpa subtitle.', [
-                'clip_id' => $clip->id,
-                'error' => $e->getMessage(),
-            ]);
+        // Give it a generous timeout, but less than the total job timeout
+        $process->setTimeout($this->timeout - 120);
+        $this->runProcess($process, 'Gagal mendownload segmen video dari YouTube.');
 
-            return null;
+        if (! file_exists($tempPath) || filesize($tempPath) === 0) {
+            throw new RuntimeException('Download segmen video selesai, tapi file hasil tidak ditemukan atau kosong.');
         }
 
-        // Cari path file subtitle dari output yt-dlp
-        if (preg_match('/\[info\] Writing video subtitles to: (.*)/', $output, $matches)) {
-            $subtitlePath = trim($matches[1]);
-            if (file_exists($subtitlePath)) {
-                $assPath = $tempDir.'/'.$clip->id.'_sub_'.Str::random(5).'.ass';
-                $offsetProcess = new Process([
-                    'ffmpeg', '-y',
-                    '-ss', (string) $clip->start_time,
-                    '-i', $subtitlePath,
-                    $assPath
-                ]);
-                $offsetProcess->run();
-
-                if ($offsetProcess->isSuccessful() && file_exists($assPath)) {
-                    // Hapus file VTT asli agar tidak menumpuk
-                    @unlink($subtitlePath);
-                    return $assPath;
-                }
-                
-                return $subtitlePath;
-            }
-        }
-
-        return null;
+        return $tempPath;
     }
 
-    private function buildFfmpegProcess(Clip $clip, array $streamUrls, string $absoluteOutputPath, ?string $subtitlePath): Process
+    private function buildFfmpegProcess(Clip $clip, string $inputPath, string $absoluteOutputPath): Process
     {
         $arguments = ['ffmpeg', '-hide_banner', '-y'];
-        $arguments = $this->appendInput($arguments, $streamUrls[0], $clip->start_time);
-
-        if (isset($streamUrls[1])) {
-            $arguments = $this->appendInput($arguments, $streamUrls[1], $clip->start_time);
-            $audioMap = '1:a:0?';
-            $streamInputCount = 2;
-        } else {
-            $audioMap = '0:a:0?';
-            $streamInputCount = 1;
-        }
-
-        $logoInputIndex = null;
+        $arguments = array_merge($arguments, ['-i', $inputPath]);
         $logoPath = base_path(self::BRAND_LOGO_PATH);
-
+        $logoInputIndex = null;
         if ($clip->watermark_enabled || $clip->signature_enabled) {
             if (! file_exists($logoPath)) {
                 throw new RuntimeException('Logo brand belum tersedia di '.self::BRAND_LOGO_PATH.'.');
             }
 
-            $logoInputIndex = $streamInputCount;
+            $logoInputIndex = 1;
             $arguments = array_merge($arguments, [
                 '-loop',
                 '1',
@@ -284,11 +210,11 @@ class ProcessVideoClipper implements ShouldQueue
             '-t',
             (string) $clip->duration,
             '-filter_complex',
-            $this->filterComplex($clip, $logoInputIndex, $subtitlePath),
+            $this->filterComplex($clip, $logoInputIndex),
             '-map',
             '[vout]',
             '-map',
-            $audioMap,
+            '0:a:0?',
             '-af',
             'loudnorm=I=-16:TP=-1.5:LRA=11',
             '-shortest',
@@ -317,27 +243,7 @@ class ProcessVideoClipper implements ShouldQueue
         return $process;
     }
 
-    /**
-     * @param  list<string>  $arguments
-     * @return list<string>
-     */
-    private function appendInput(array $arguments, string $url, int $startTime): array
-    {
-        return array_merge($arguments, [
-            '-ss',
-            $this->secondsToTimestamp($startTime),
-            '-reconnect',
-            '1',
-            '-reconnect_streamed',
-            '1',
-            '-reconnect_delay_max',
-            '5',
-            '-i',
-            $url,
-        ]);
-    }
-
-    private function filterComplex(Clip $clip, ?int $logoInputIndex, ?string $subtitlePath): string
+    private function filterComplex(Clip $clip, ?int $logoInputIndex): string
     {
         $fontPath = $this->getEscapedFontPath();
         $parts = [
@@ -348,12 +254,6 @@ class ProcessVideoClipper implements ShouldQueue
 
         if ($fontPath && $clip->hook_text_enabled && ! empty($clip->hook_text_content)) {
             $parts[] = '['.$current.']'.$this->hookTextFilter($clip, $fontPath).'[v'.$step.']';
-            $current = 'v'.$step;
-            $step++;
-        }
-
-        if ($subtitlePath) {
-            $parts[] = '['.$current.']'.$this->subtitleFilter($subtitlePath).'[v'.$step.']';
             $current = 'v'.$step;
             $step++;
         }
@@ -418,20 +318,6 @@ class ProcessVideoClipper implements ShouldQueue
         return "drawtext=fontfile='{$fontPath}':text='{$text}':fontcolor={$fontColor}:fontsize={$fontSize}:x=(w-text_w)/2:y={$yPos}:box=1:boxcolor=black@0.5:boxborderw=15:enable='gte(t,{$startTime})'";
     }
 
-    private function subtitleFilter(string $subtitlePath): string
-    {
-        // FFmpeg di Windows memerlukan path escaping yang sangat spesifik untuk filter subtitle.
-        $escapedPath = str_replace('\\', '/', $subtitlePath);
-        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-            $escapedPath = str_replace(':', '\\:', $escapedPath);
-        }
-
-        // Style: Bold, Putih dengan outline/shadow hitam, di tengah bawah (posisi aman).
-        $style = "FontName=Open Sans,FontSize=42,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=350";
-
-        return "subtitles='{$escapedPath}':force_style='{$style}'";
-    }
-
     private function getEscapedFontPath(): ?string
     {
         $fontPath = base_path(self::TEXT_OVERLAY_FONT_PATH);
@@ -453,7 +339,7 @@ class ProcessVideoClipper implements ShouldQueue
     private function baseVideoFilter(Clip $clip): string
     {
         $filters = [
-            $this->cropFilter($clip->crop_mode),
+            $this->cropFilter($clip),
             'scale=1080:1920', // dihapus flags=lanczos karena terlalu berat untuk CPU
             'fps=30',
             'setsar=1',
@@ -467,14 +353,25 @@ class ProcessVideoClipper implements ShouldQueue
         return implode(',', $filters);
     }
 
-    private function cropFilter(string $cropMode): string
+    private function cropFilter(Clip $clip): string
     {
-        $xFactor = match ($cropMode) {
+        // Mode 'fill' untuk video potrait/miring agar tidak terpotong,
+        // video akan diskalakan dan diberi bar hitam (padding) jika perlu.
+        if ($clip->crop_mode === 'fill') {
+            return 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black';
+        }
+
+        $duration = max(1, $clip->duration); // Hindari pembagian dengan nol
+
+        $xFactor = match ($clip->crop_mode) {
             'left' => '0',
             'right' => '1',
-            default => '0.5',
+            // Mode Pan & Scan. Crop akan bergerak dari 25% ke 75% area horizontal.
+            'pan_center' => sprintf('(0.25 + 0.5 * (t/%d))', $duration),
+            default => '0.5', // center
         };
 
+        // Filter crop dinamis untuk sumber video landscape, mengubahnya menjadi potrait 9:16.
         return "crop='if(gt(a,9/16),ih*9/16,iw)':'if(gt(a,9/16),ih,iw*16/9)':'if(gt(a,9/16),(iw-ih*9/16)*{$xFactor},0)':'if(gt(a,9/16),0,(ih-iw*16/9)*0.5)'";
     }
 
