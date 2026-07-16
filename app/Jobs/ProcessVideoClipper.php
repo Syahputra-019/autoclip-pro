@@ -123,8 +123,6 @@ class ProcessVideoClipper implements ShouldQueue
             if ($tempVideoPath && file_exists($tempVideoPath)) {
                 unlink($tempVideoPath);
             }
-
-            throw $exception;
         }
     }
 
@@ -168,6 +166,11 @@ class ProcessVideoClipper implements ShouldQueue
             config('media-tools.yt_dlp_path', 'yt-dlp'),
             '--no-playlist',
             '--no-warnings',
+            '--no-cache-dir', // Bersihkan cache untuk menghindari state yang usang
+            '--retries', '5', // Coba lagi jika ada error network
+            '--fragment-retries', '5',
+            // Mimik browser untuk mengurangi kemungkinan diblokir
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
             '-f', $this->formatSelector($clip->quality_height),
             '--download-sections', "*{$startTime}-{$endTime}",
             '--force-keyframes-at-cuts',
